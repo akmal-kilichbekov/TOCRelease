@@ -1,0 +1,261 @@
+*&---------------------------------------------------------------------*
+*& Report ZRT_WMV_TEST
+*&---------------------------------------------------------------------*
+*&
+*&---------------------------------------------------------------------*
+REPORT zrt_wmv_test.
+
+DATA :
+  gt_e070   TYPE TABLE OF e070,
+   gv_trkorr TYPE trkorr.
+
+CONSTANTS :
+  co_charx     TYPE c VALUE 'X',
+  co_tarsystem TYPE tr_target VALUE 'AKB.100'.   "This must be changed depending on system
+
+SELECTION-SCREEN : BEGIN OF BLOCK b1 WITH FRAME.
+PARAMETERS : p_from TYPE trkorr OBLIGATORY.
+PARAMETERS : p_to   TYPE trkorr MEMORY ID kor.
+SELECTION-SCREEN : END OF BLOCK b1.
+
+SELECTION-SCREEN : BEGIN OF BLOCK b2 WITH FRAME.
+PARAMETERS : p_rel  AS CHECKBOX DEFAULT 'X'.
+PARAMETERS : p_tarsys LIKE e070-tarsystem DEFAULT co_tarsystem.
+SELECTION-SCREEN : END OF BLOCK b2.
+
+
+INITIALIZATION.
+  IF p_to IS INITIAL.
+
+    GET PARAMETER ID 'KOR' FIELD p_to.
+    SELECT COUNT(*) FROM e070 WHERE trkorr = p_to
+                                AND trstatus = 'D'.
+    IF sy-dbcnt = 0.
+      CLEAR p_to.
+      SET PARAMETER ID 'KOR' FIELD p_to.
+    ENDIF.
+  ENDIF.
+
+AT SELECTION-SCREEN.
+
+  IF p_to IS INITIAL.
+    GET PARAMETER ID 'KOR' FIELD p_to.
+    SELECT COUNT(*) FROM e070 WHERE trkorr = p_to
+                                AND trstatus = 'D'.
+    IF sy-dbcnt = 0.
+      CLEAR p_to.
+      SET PARAMETER ID 'KOR' FIELD p_to.
+    ENDIF.
+
+  ENDIF.
+
+*--- Get request and underlaying open task numbers
+  SELECT * FROM e070 INTO TABLE gt_e070
+                            WHERE ( trkorr = p_from OR
+                                    strkorr = p_from )
+                              AND  trstatus = 'D'.
+
+  IF sy-dbcnt = 0.
+    MESSAGE e368(00) WITH 'Source request no longer open'.
+  ENDIF.
+
+AT SELECTION-SCREEN ON VALUE-REQUEST FOR p_from.
+  PERFORM f4_request CHANGING p_from.
+
+START-OF-SELECTION.
+  PERFORM trkorr_create.
+  PERFORM trkorr_update.
+  IF p_rel IS NOT INITIAL.
+    PERFORM trkorr_release.
+  ENDIF.
+
+*&--------------------------------------------------------------------*
+*&      Form  create_transport_request
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM trkorr_create.
+
+  DATA : lv_create. "Create new transport request?
+  DATA : lv_text        LIKE e07t-as4text.
+  DATA : lv_trfunction  TYPE trfunction VALUE 'T'.
+
+
+  IF p_to IS INITIAL.
+    lv_create = 'X'.
+  ELSE.
+    SELECT COUNT(*) FROM e070 WHERE trkorr   = p_to
+                                AND trfunction = lv_trfunction
+                                AND trstatus = 'D'
+                                AND as4user  = sy-uname.
+    IF sy-dbcnt = 0.
+      lv_create = co_charx.
+    ELSE.
+      gv_trkorr = p_to.
+      SET PARAMETER ID 'KOR' FIELD gv_trkorr.
+    ENDIF.
+  ENDIF.
+
+  IF lv_create IS INITIAL.
+    EXIT.
+  ENDIF.
+
+
+
+  SORT gt_e070 BY strkorr trkorr.
+  READ TABLE gt_e070 INDEX 1 ASSIGNING FIELD-SYMBOL(<e070>).
+  SELECT SINGLE as4text FROM e07t INTO lv_text
+                        WHERE trkorr = <e070>-trkorr.
+
+  SHIFT lv_text RIGHT BY 3 PLACES.
+
+  lv_text+0(2) = 'TT'.
+
+
+  CALL FUNCTION 'TRINT_INSERT_NEW_COMM'
+    EXPORTING
+      wi_kurztext       = lv_text
+      wi_trfunction     = lv_trfunction
+      iv_tarsystem      = p_tarsys
+      wi_client         = sy-mandt
+    IMPORTING
+      we_trkorr         = gv_trkorr
+    EXCEPTIONS
+      no_systemname     = 1
+      no_systemtype     = 2
+      no_authorization  = 3
+      db_access_error   = 4
+      file_access_error = 5
+      enqueue_error     = 6
+      number_range_full = 7
+      invalid_input     = 8
+      OTHERS            = 9.
+  IF sy-subrc <> 0.
+    MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+            WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+  ENDIF.
+
+
+  COMMIT WORK.
+
+ENDFORM.                    "create_transport_request
+
+*&--------------------------------------------------------------------*
+*&      Form  update_transport_request
+*&--------------------------------------------------------------------*
+*       text
+*---------------------------------------------------------------------*
+FORM trkorr_update.
+
+*--- for each task ID copy the objects to the target request
+  LOOP  AT gt_e070 ASSIGNING FIELD-SYMBOL(<e070>).
+
+    CALL FUNCTION 'TR_COPY_COMM'
+      EXPORTING
+        wi_dialog                = ' '
+        wi_trkorr_from           = <e070>-trkorr
+        wi_trkorr_to             = gv_trkorr
+        wi_without_documentation = 'X'
+      EXCEPTIONS
+        db_access_error          = 1
+        trkorr_from_not_exist    = 2
+        trkorr_to_is_repair      = 3
+        trkorr_to_locked         = 4
+        trkorr_to_not_exist      = 5
+        trkorr_to_released       = 6
+        user_not_owner           = 7
+        no_authorization         = 8
+        wrong_client             = 9
+        wrong_category           = 10
+        object_not_patchable     = 11
+        OTHERS                   = 12.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+             WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      COMMIT WORK.
+    ENDIF.
+
+    CALL FUNCTION 'TR_SORT_AND_COMPRESS_COMM'
+      EXPORTING
+        iv_trkorr                      = gv_trkorr
+      EXCEPTIONS
+        trkorr_not_found               = 1
+        order_released                 = 2
+        error_while_modifying_obj_list = 3
+        tr_enqueue_failed              = 4
+        no_authorization               = 5
+        OTHERS                         = 6.
+    IF sy-subrc <> 0.
+      MESSAGE ID sy-msgid TYPE sy-msgty NUMBER sy-msgno
+              WITH sy-msgv1 sy-msgv2 sy-msgv3 sy-msgv4.
+    ELSE.
+      COMMIT WORK.
+    ENDIF.
+
+
+  ENDLOOP.
+
+
+  SET PARAMETER ID 'KOR' FIELD gv_trkorr.
+ENDFORM.                    "update_transport_request
+
+*&---------------------------------------------------------------------*
+*&      Form  trkorr_release
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+FORM trkorr_release.
+
+  CALL FUNCTION 'TRINT_RELEASE_REQUEST'
+    EXPORTING
+      iv_trkorr                   = gv_trkorr
+      iv_dialog                   = 'X'
+      iv_as_background_job        = ' '
+      iv_success_message          = ' '
+      iv_without_objects_check    = 'X'
+      iv_without_locking          = 'X'
+    EXCEPTIONS
+      cts_initialization_failure  = 1
+      enqueue_failed              = 2
+      no_authorization            = 3
+      invalid_request             = 4
+      request_already_released    = 5
+      repeat_too_early            = 6
+      object_lock_error           = 7
+      object_check_error          = 8
+      docu_missing                = 9
+      db_access_error             = 10
+      action_aborted_by_user      = 11
+      export_failed               = 12
+      execute_objects_check       = 13
+      release_in_bg_mode          = 14
+      release_in_bg_mode_w_objchk = 15
+      error_in_export_methods     = 16
+      object_lang_error           = 17
+      OTHERS                      = 18.
+
+
+  IF sy-subrc = 0.
+    SET PARAMETER ID 'KOR' FIELD ' '.
+  ENDIF.
+
+
+ENDFORM.                    "trkorr_release
+
+
+FORM f4_request CHANGING pv_trkorr.
+
+  DATA: lv_trkorr TYPE trkorr.
+
+  CALL FUNCTION 'TR_F4_REQUESTS'
+    EXPORTING
+      iv_client           = sy-mandt
+    IMPORTING
+      ev_selected_request = lv_trkorr.
+
+  IF lv_trkorr IS NOT INITIAL.
+    pv_trkorr = lv_trkorr.
+  ENDIF.
+
+ENDFORM.
